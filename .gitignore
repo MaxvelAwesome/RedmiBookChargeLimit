@@ -1,0 +1,7 @@
+build/
+*.obj
+*.res
+*.pdb
+*.ilk
+res/icon_preview.png
+.vs/
