@@ -262,11 +262,15 @@ void App::SendCommand(uint32_t cmd, uint32_t arg) {
 }
 
 void App::OnData(std::unique_ptr<Data> d, bool fromCommand) {
+    if (fromCommand) {
+        busy_ = false;
+    } else {
+        refreshing_ = false;
+        // Пока команда выполняется, канал занят ею: фоновый снимок устарел или пуст («служба не отвечает»).
+        if (busy_) return;
+    }
     data_ = *d;
     haveData_ = true;
-    if (fromCommand) busy_ = false;
-    else refreshing_ = false;
-    if (!showEvent_) showEvent_ = OpenEventW(SYNCHRONIZE, FALSE, app::kShowEvent);
     TrayUpdate();
     if (visible_) InvalidateRect(hwnd_, nullptr, FALSE);
 }
@@ -911,10 +915,7 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
                 SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
             }
         }
-        if (wp == kTimerSlow) {
-            if (!showEvent_) showEvent_ = OpenEventW(SYNCHRONIZE, FALSE, app::kShowEvent);
-            if (!visible_) RequestRefresh();
-        }
+        if (wp == kTimerSlow && !visible_) RequestRefresh();
         return 0;
 
     case WM_POWERBROADCAST:
@@ -1022,8 +1023,8 @@ LRESULT App::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
 int App::Run(HINSTANCE inst, bool startHidden) {
     inst_ = inst;
 
-    // Один экземпляр на систему: второй запуск просто показывает окно первого.
-    mutex_ = CreateMutexW(nullptr, FALSE, app::kUiMutex);
+    // Один экземпляр на сессию пользователя: второй запуск просто показывает окно первого.
+    mutex_ = CreateMutexW(nullptr, FALSE, (std::wstring(L"Local\\") + app::kUiMutexName).c_str());
     if (!mutex_ || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (!startHidden) {
             if (HWND w = FindWindowW(app::kWindowClass, nullptr)) {
@@ -1051,7 +1052,9 @@ int App::Run(HINSTANCE inst, bool startHidden) {
     CreateWindowExW(0, app::kWindowClass, L"RedmiBook Charge Limit", style, CW_USEDEFAULT, CW_USEDEFAULT,
                     480, 700, nullptr, nullptr, inst, nullptr);
     if (!hwnd_) { CloseHandle(mutex_); return 1; }
-    showEvent_ = OpenEventW(SYNCHRONIZE, FALSE, app::kShowEvent);
+    // Событие «показать окно» (кнопка Xiaomi): создаём в своей сессии; DACL по умолчанию — текущий
+    // пользователь и SYSTEM, поэтому служба может его выставить, а другие пользователи — нет.
+    showEvent_ = CreateEventW(nullptr, FALSE, FALSE, (std::wstring(L"Local\\") + app::kShowEventName).c_str());
     if (!startHidden) ShowMain();
     else SetProcessWorkingSetSize(GetCurrentProcess(), static_cast<SIZE_T>(-1), static_cast<SIZE_T>(-1));
 

@@ -130,6 +130,19 @@ bool StopService(SC_HANDLE svc) {
 }
 
 void DeleteTree(const std::wstring& dir) {
+    // Сам корень может оказаться ссылкой (junction/symlink): удаляем только ссылку, внутрь не идём —
+    // иначе администратор удалил бы содержимое произвольного каталога.
+    DWORD attrs = GetFileAttributesW(dir.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return;
+    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+        if (!RemoveDirectoryW(dir.c_str())) DeleteFileW(dir.c_str());
+        return;
+    }
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(dir.c_str());
+        return;
+    }
     WIN32_FIND_DATAW fd;
     HANDLE f = FindFirstFileW((dir + L"\\*").c_str(), &fd);
     if (f != INVALID_HANDLE_VALUE) {
@@ -159,7 +172,7 @@ void RemoveLegacy() {
     if (data.empty()) return;
     std::wstring legacyExe = data + L"\\app\\" + app::kExeName;
     KillByPath(legacyExe);
-    if (GetFileAttributesW((data + L"\\app").c_str()) != INVALID_FILE_ATTRIBUTES) DeleteTree(data + L"\\app");
+    DeleteTree(data + L"\\app");
     DeleteFileW((data + L"\\config.json").c_str());
     DeleteFileW((data + L"\\charge-limit.log").c_str());
 }
@@ -272,6 +285,11 @@ int RunElevated(const wchar_t* args) {
 int Install(bool quiet) {
     if (!IsElevated()) return RunElevated(quiet ? L"--install --quiet" : L"--install");
     app::LogInit(L"setup");
+    // До любой записи в ProgramData: каталог с защищёнными правами (см. SecureDataDir).
+    if (!app::SecureDataDir()) {
+        Message(quiet, L"Не удалось подготовить папку данных в ProgramData.", MB_ICONERROR);
+        return 6;
+    }
     Log(L"Установка %s", app::kAppVersion);
 
     std::wstring self = app::SelfPath();
@@ -281,10 +299,21 @@ int Install(bool quiet) {
 
     ScHandle scm(OpenSCManagerW(nullptr, nullptr, SC_MANAGER_ALL_ACCESS));
     if (!scm) { Message(quiet, L"Нет доступа к диспетчеру служб.", MB_ICONERROR); return 2; }
+    // Если обновление сорвётся, старая служба не должна остаться остановленной.
+    bool oldWasRunning = false;
     {
         ScHandle old(OpenServiceW(scm.get(), app::kServiceName, SERVICE_STOP | SERVICE_QUERY_STATUS));
-        if (old) StopService(old.get());
+        if (old) {
+            SERVICE_STATUS st{};
+            oldWasRunning = QueryServiceStatus(old.get(), &st) && st.dwCurrentState != SERVICE_STOPPED;
+            StopService(old.get());
+        }
     }
+    auto restoreOld = [&] {
+        if (!oldWasRunning) return;
+        ScHandle old(OpenServiceW(scm.get(), app::kServiceName, SERVICE_START));
+        if (old && StartServiceW(old.get(), 0, nullptr)) Log(L"Прежняя служба запущена снова.");
+    };
     CloseRunningUi();
 
     if (!SamePath(self, target)) {
@@ -296,6 +325,7 @@ int Install(bool quiet) {
         }
         if (!copied) {
             Log(L"Не удалось скопировать exe: %lu", GetLastError());
+            restoreOld();
             Message(quiet, L"Не удалось скопировать файл приложения в Program Files.", MB_ICONERROR);
             return 3;
         }
@@ -313,6 +343,7 @@ int Install(bool quiet) {
     }
     if (!svc) {
         Log(L"CreateService: %lu", GetLastError());
+        restoreOld();
         Message(quiet, L"Не удалось зарегистрировать службу.", MB_ICONERROR);
         return 4;
     }
@@ -334,7 +365,6 @@ int Install(bool quiet) {
     // Настройки по умолчанию: лимит включён.
     if (app::RegGetDword(L"Enabled", 2) == 2) app::RegSetDword(L"Enabled", 1);
     app::RegSetDword(L"FullCharge", 0);
-    CreateDirectoryW(app::DataDir().c_str(), nullptr);
 
     CreateShortcut(target);
     WriteUninstallEntry(target);
@@ -373,6 +403,8 @@ int Uninstall(bool quiet) {
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, app::kRegKey);
     RegDeleteKeyW(HKEY_LOCAL_MACHINE, app::kRegKey);
 
+    // Перед удалением убеждаемся, что DataDir — настоящий каталог, а не подложенная ссылка.
+    app::SecureDataDir();
     RemoveLegacy();
     std::wstring data = app::DataDir();
     if (!data.empty()) DeleteTree(data);

@@ -19,11 +19,17 @@ rc /nologo /fo build\app.res res\app.rc || exit /b 1
 set CFLAGS=/nologo /std:c++20 /utf-8 /EHsc /MT /O1 /Os /GL /Gy /Gw /GS /sdl /guard:cf /W4 /permissive- ^
  /DUNICODE /D_UNICODE /DNDEBUG /D_WIN32_WINNT=0x0A00 /DWINVER=0x0A00
 set LIBS=d2d1.lib dwrite.lib dwmapi.lib comctl32.lib shell32.lib setupapi.lib wbemuuid.lib ole32.lib ^
- oleaut32.lib userenv.lib wtsapi32.lib advapi32.lib user32.lib
+ oleaut32.lib userenv.lib wtsapi32.lib advapi32.lib user32.lib delayimp.lib
+
+rem Защита от подмены DLL, когда установщик запускают с повышением из «Загрузок»:
+rem  /DEPENDENTLOADFLAG:0x800 — статические импорты ищутся только в System32 (LOAD_LIBRARY_SEARCH_SYSTEM32);
+rem  /DELAYLOAD — DLL не из KnownDLLs грузятся после SetDefaultDllDirectories в wWinMain.
+set DELAY=/DELAYLOAD:d2d1.dll /DELAYLOAD:dwrite.dll /DELAYLOAD:dwmapi.dll /DELAYLOAD:setupapi.dll ^
+ /DELAYLOAD:userenv.dll /DELAYLOAD:wtsapi32.dll
 
 cl %CFLAGS% /Fobuild\ src\*.cpp build\app.res /Fe:build\RedmiChargeLimit.exe ^
  /link /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS /MANIFEST:NO /DYNAMICBASE /NXCOMPAT /CETCOMPAT /guard:cf ^
- /INCREMENTAL:NO %LIBS% || exit /b 1
+ /DEPENDENTLOADFLAG:0x800 %DELAY% /INCREMENTAL:NO %LIBS% || exit /b 1
 
 for %%f in (build\RedmiChargeLimit.exe) do echo Built %%~ff - %%~zf bytes
 exit /b 0

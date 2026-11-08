@@ -22,8 +22,11 @@ inline constexpr wchar_t kExeName[]        = L"RedmiChargeLimit.exe";
 inline constexpr wchar_t kRegKey[]         = L"SOFTWARE\\RedmiChargeLimit";
 inline constexpr wchar_t kUninstallKey[]   = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\RedmiChargeLimit";
 inline constexpr wchar_t kPipeName[]       = L"\\\\.\\pipe\\RedmiChargeLimit";
-inline constexpr wchar_t kUiMutex[]        = L"Global\\RedmiChargeLimit.UI";
-inline constexpr wchar_t kShowEvent[]      = L"Global\\RedmiChargeLimit.Show";
+// Объекты UI живут в пространстве имён сессии пользователя: UI создаёт их как Local\<имя>,
+// служба (сессия 0) открывает как Session\<id>\<имя>. Так у каждого пользователя свой трей,
+// и чужой пользователь не может «занять» имя заранее.
+inline constexpr wchar_t kUiMutexName[]    = L"RedmiChargeLimit.UI";
+inline constexpr wchar_t kShowEventName[]  = L"RedmiChargeLimit.Show";
 inline constexpr wchar_t kWindowClass[]    = L"RedmiChargeLimit.Window";
 inline constexpr wchar_t kShortcutName[]   = L"RedmiBook Charge Limit.lnk";
 
@@ -72,6 +75,12 @@ std::wstring DirName(const std::wstring& path);
 std::wstring InstallDir();
 // %ProgramData%\RedmiChargeLimit
 std::wstring DataDir();
+// Создаёт DataDir (или исправляет существующий) с владельцем Administrators и защищённым DACL:
+// SYSTEM/Administrators — полный доступ, Users — только чтение. Если на месте каталога оказалась
+// ссылка (junction/symlink) или файл — удаляет её и создаёт каталог заново. Только для SYSTEM/админа.
+bool SecureDataDir();
+// Имя объекта UI в сессии session, как его видит служба: Session\<id>\<name>.
+std::wstring SessionObjectName(DWORD session, const wchar_t* name);
 
 // Настройки (HKLM\SOFTWARE\RedmiChargeLimit). Чтение доступно всем, запись — только SYSTEM/admin.
 DWORD RegGetDword(const wchar_t* name, DWORD def);

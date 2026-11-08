@@ -9,7 +9,6 @@
 #include "ipc.h"
 #include "mifs.h"
 
-#include <sddl.h>
 #include <userenv.h>
 #include <wtsapi32.h>
 #include <cstdio>
@@ -34,8 +33,8 @@ SERVICE_STATUS g_status{};
 Handle g_stop;      // остановка службы
 Handle g_kick;      // применить с задержкой (debounce)
 Handle g_kickNow;   // применить немедленно
-Handle g_showEvent; // сигнал UI «показать окно»
 
+SRWLOCK g_statusLock = SRWLOCK_INIT;  // SetStatus вызывается из ServiceMain и из обработчика SCM
 SRWLOCK g_lock = SRWLOCK_INIT;
 CONDITION_VARIABLE g_cv = CONDITION_VARIABLE_INIT;
 ipc::State g_state;          // защищено g_lock
@@ -45,6 +44,7 @@ BYTE g_lastAc = 0xFF;        // последний известный источ
 
 void SetStatus(DWORD state, DWORD exitCode = NO_ERROR, DWORD waitHint = 0) {
     static DWORD checkpoint = 1;
+    AcquireSRWLockExclusive(&g_statusLock);
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_status.dwCurrentState = state;
     g_status.dwWin32ExitCode = exitCode;
@@ -54,6 +54,18 @@ void SetStatus(DWORD state, DWORD exitCode = NO_ERROR, DWORD waitHint = 0) {
         : 0;
     g_status.dwCheckPoint = (state == SERVICE_RUNNING || state == SERVICE_STOPPED) ? 0 : checkpoint++;
     SetServiceStatus(g_ssh, &g_status);
+    ReleaseSRWLockExclusive(&g_statusLock);
+}
+
+// Ждёт поток до timeoutMs, сообщая SCM о ходе остановки. false — поток завис.
+bool JoinWithTimeout(std::thread& t, DWORD timeoutMs) {
+    if (!t.joinable()) return true;
+    for (DWORD waited = 0; waited < timeoutMs; waited += 1000) {
+        if (WaitForSingleObject(t.native_handle(), 1000) == WAIT_OBJECT_0) { t.join(); return true; }
+        SetStatus(SERVICE_STOP_PENDING, NO_ERROR, 3000);
+    }
+    t.detach();
+    return false;
 }
 
 // Запрос немедленного применения и ожидание результата (из потоков, отличных от рабочего).
@@ -78,9 +90,15 @@ ipc::State Snapshot() {
 }
 
 // ---------- запуск UI в сессии пользователя ----------
-bool UiRunning() {
-    Handle m(OpenMutexW(SYNCHRONIZE, FALSE, app::kUiMutex));
+// UI создаёт мьютекс и событие в своей сессии (Local\...), служба видит их как Session\<id>\....
+bool UiRunning(DWORD session) {
+    Handle m(OpenMutexW(SYNCHRONIZE, FALSE, app::SessionObjectName(session, app::kUiMutexName).c_str()));
     return static_cast<bool>(m);
+}
+
+bool SignalShow(DWORD session) {
+    Handle e(OpenEventW(EVENT_MODIFY_STATE, FALSE, app::SessionObjectName(session, app::kShowEventName).c_str()));
+    return e && SetEvent(e.get());
 }
 
 bool LaunchUi(DWORD session, const wchar_t* args) {
@@ -117,9 +135,9 @@ bool LaunchUi(DWORD session, const wchar_t* args) {
 void LaunchTrayAsync(DWORD session) {
     std::thread([session] {
         // Даём Explorer'у подняться после входа.
-        for (int i = 0; i < 20 && !UiRunning(); ++i) {
+        for (int i = 0; i < 20 && !UiRunning(session); ++i) {
             if (WaitForSingleObject(g_stop.get(), i == 0 ? 3000 : 1000) != WAIT_TIMEOUT) return;
-            if (UiRunning()) return;
+            if (UiRunning(session)) return;
             if (LaunchUi(session, L"--tray")) return;
         }
     }).detach();
@@ -131,11 +149,9 @@ void OnMiButton() {
     if (now - last < 600) return;
     last = now;
     Log(L"Нажата кнопка Xiaomi.");
-    if (UiRunning()) {
-        SetEvent(g_showEvent.get());
-    } else {
-        LaunchUi(WTSGetActiveConsoleSessionId(), L"--show");
-    }
+    DWORD session = WTSGetActiveConsoleSessionId();
+    if (session == 0xFFFFFFFF || session == 0) return;
+    if (!SignalShow(session) && !UiRunning(session)) LaunchUi(session, L"--show");
 }
 
 // ---------- рабочий поток: всё общение с прошивкой ----------
@@ -150,12 +166,21 @@ void WorkerThread() {
         bool force = true;  // первое применение при старте
 
         while (true) {
+            // Номер запроса фиксируем ДО чтения настроек: запрос, пришедший позже, точно обработается
+            // на следующей итерации, и UI не получит устаревшее состояние.
+            uint64_t seqAtStart;
+            AcquireSRWLockShared(&g_lock);
+            seqAtStart = g_reqSeq;
+            ReleaseSRWLockShared(&g_lock);
+
             // --- подключение (WMI может быть ещё не готов на ранней загрузке) ---
             if (!cli.Connected() && !unsupported) {
                 if (!cli.Connect()) {
                     AcquireSRWLockExclusive(&g_lock);
                     g_state.hw = ipc::kHwError;
+                    if (g_doneSeq < seqAtStart) g_doneSeq = seqAtStart;  // не держим UI до таймаута
                     ReleaseSRWLockExclusive(&g_lock);
+                    WakeAllConditionVariable(&g_cv);
                     if (WaitForSingleObject(g_stop.get(), 5000) != WAIT_TIMEOUT) break;
                     continue;
                 }
@@ -207,11 +232,6 @@ void WorkerThread() {
                 }
             }
 
-            uint64_t seqAtStart;
-            AcquireSRWLockShared(&g_lock);
-            seqAtStart = g_reqSeq;
-            ReleaseSRWLockShared(&g_lock);
-
             uint8_t hwCode = 0xFF;
             uint8_t hw = ipc::kHwUnknown;
             if (unsupported) {
@@ -221,6 +241,8 @@ void WorkerThread() {
                 if (!force) {
                     s = cli.Get(mifs::kSubLimit, hwCode);
                     if (s == mifs::Status::Ok && hwCode != want) force = true;
+                    // Соединение с WMI могло порваться (например, после сна) — переподключимся.
+                    if (s == mifs::Status::Error) cli.Disconnect();
                 }
                 if (force) {
                     s = cli.SetLimitCode(want);
@@ -376,15 +398,8 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
     g_stop.reset(CreateEventW(nullptr, TRUE, FALSE, nullptr));
     g_kick.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
     g_kickNow.reset(CreateEventW(nullptr, FALSE, FALSE, nullptr));
-
-    // Событие «показать окно»: UI (обычный пользователь) может только ждать его.
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00100000;;;IU)",
-                                                             SDDL_REVISION_1, &sd, nullptr)) {
-        SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
-        g_showEvent.reset(CreateEventW(&sa, FALSE, FALSE, app::kShowEvent));
-        LocalFree(sd);
-    }
+    // Папка журнала — с защищёнными правами, до первой записи в неё.
+    if (!app::SecureDataDir()) Log(L"Не удалось защитить папку данных.");
 
     SYSTEM_POWER_STATUS sps{};
     if (GetSystemPowerStatus(&sps)) g_lastAc = sps.ACLineStatus;
@@ -410,11 +425,14 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
     LaunchTrayAsync(WTSGetActiveConsoleSessionId());
 
     WaitForSingleObject(g_stop.get(), INFINITE);
-    worker.join();
-    pipe.join();
-    buttons.join();
-    Log(L"Служба остановлена.");
+    // Вызов WMI может зависнуть — не держим SCM бесконечно.
+    bool clean = JoinWithTimeout(worker, 10000);
+    clean = JoinWithTimeout(pipe, 3000) && clean;
+    clean = JoinWithTimeout(buttons, 3000) && clean;
+    Log(clean ? L"Служба остановлена." : L"Служба остановлена (часть потоков не завершилась вовремя).");
     SetStatus(SERVICE_STOPPED);
+    // Зависшие потоки используют глобальные объекты — выходим, не запуская их деструкторы.
+    if (!clean) ExitProcess(0);
 }
 
 }  // namespace
@@ -436,6 +454,7 @@ int RunDiag() {
     freopen_s(&f, "CONOUT$", "w", stdout);
     SetConsoleOutputCP(CP_UTF8);
     app::LogInit(L"diag");
+    app::SecureDataDir();
 
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 1;
     mifs::InitProcessComSecurity();

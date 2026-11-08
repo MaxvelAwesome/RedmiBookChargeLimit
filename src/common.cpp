@@ -1,5 +1,7 @@
 #include "common.h"
 
+#include <aclapi.h>
+#include <sddl.h>
 #include <shlobj.h>
 #include <cstdarg>
 #include <cwchar>
@@ -38,6 +40,69 @@ std::wstring DataDir() {
     return b.empty() ? b : b + L"\\RedmiChargeLimit";
 }
 
+std::wstring SessionObjectName(DWORD session, const wchar_t* name) {
+    return L"Session\\" + std::to_wstring(session) + L"\\" + name;
+}
+
+namespace {
+// Владелец Administrators; SYSTEM и Administrators — полный доступ, Users — чтение (наследуется).
+constexpr wchar_t kDataDirSddl[] = L"O:BAD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)";
+
+void EnablePrivilege(const wchar_t* name) {
+    HANDLE raw = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &raw)) return;
+    Handle tok(raw);
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (LookupPrivilegeValueW(nullptr, name, &tp.Privileges[0].Luid))
+        AdjustTokenPrivileges(tok.get(), FALSE, &tp, sizeof(tp), nullptr, nullptr);
+}
+}  // namespace
+
+bool SecureDataDir() {
+    const std::wstring dir = DataDir();
+    if (dir.empty()) return false;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(kDataDirSddl, SDDL_REVISION_1, &sd, nullptr)) return false;
+    // Каталог мог создать обычный пользователь (и закрыть нам доступ) — берём права резервного
+    // восстановления, чтобы сменить владельца и DACL.
+    EnablePrivilege(SE_RESTORE_NAME);
+    EnablePrivilege(SE_TAKE_OWNERSHIP_NAME);
+
+    bool ok = false;
+    for (int attempt = 0; attempt < 3 && !ok; ++attempt) {
+        SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
+        if (CreateDirectoryW(dir.c_str(), &sa)) { ok = true; break; }
+        if (GetLastError() != ERROR_ALREADY_EXISTS) break;
+
+        // Уже есть. Открываем сам объект (не цель ссылки) и проверяем через дескриптор — без гонки
+        // между проверкой и сменой прав.
+        Handle h(CreateFileW(dir.c_str(), READ_CONTROL | WRITE_DAC | WRITE_OWNER | DELETE | FILE_READ_ATTRIBUTES,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!h) break;
+        FILE_BASIC_INFO bi{};
+        if (!GetFileInformationByHandleEx(h.get(), FileBasicInfo, &bi, sizeof(bi))) break;
+        if ((bi.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || !(bi.FileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            // Подменённый путь: удаляем саму ссылку/файл (цель не трогается) и создаём каталог заново.
+            FILE_DISPOSITION_INFO di{TRUE};
+            if (!SetFileInformationByHandle(h.get(), FileDispositionInfo, &di, sizeof(di))) break;
+            continue;  // h закроется -> объект удалён
+        }
+        PSID owner = nullptr;
+        PACL dacl = nullptr;
+        BOOL def = FALSE, present = FALSE;
+        GetSecurityDescriptorOwner(sd, &owner, &def);
+        GetSecurityDescriptorDacl(sd, &present, &dacl, &def);
+        ok = SetSecurityInfo(h.get(), SE_FILE_OBJECT,
+                             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                             owner, nullptr, dacl, nullptr) == ERROR_SUCCESS;
+    }
+    LocalFree(sd);
+    return ok;
+}
+
 DWORD RegGetDword(const wchar_t* name, DWORD def) {
     DWORD v = 0, sz = sizeof(v);
     if (RegGetValueW(HKEY_LOCAL_MACHINE, kRegKey, name, RRF_RT_REG_DWORD, nullptr, &v, &sz) == ERROR_SUCCESS)
@@ -73,9 +138,9 @@ wchar_t g_logTag[16] = L"app";
 constexpr LONGLONG kMaxLog = 64 * 1024;
 
 void WriteLine(const wchar_t* text) {
+    // Каталог здесь не создаём: его с правильными правами создаёт SecureDataDir() (служба/установщик).
     std::wstring dir = DataDir();
     if (dir.empty()) return;  // папка не определилась
-    CreateDirectoryW(dir.c_str(), nullptr);
     std::wstring path = dir + L"\\log.txt";
 
     SYSTEMTIME st;
@@ -101,11 +166,21 @@ void WriteLine(const wchar_t* text) {
             MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
         }
     }
-    Handle f(CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (f) {
+    // Пишем только в обычный файл: не следуем по ссылкам и не пишем в жёсткую ссылку на чужой файл.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        Handle f(CreateFileW(path.c_str(), FILE_APPEND_DATA | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!f) break;
+        BY_HANDLE_FILE_INFORMATION fi{};
+        if (!GetFileInformationByHandle(f.get(), &fi)) break;
+        if ((fi.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) || fi.nNumberOfLinks != 1) {
+            f.reset();
+            DeleteFileW(path.c_str());  // удаляется сама ссылка, не цель
+            continue;
+        }
         DWORD written = 0;
         WriteFile(f.get(), utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
+        break;
     }
     ReleaseSRWLockExclusive(&g_logLock);
 }
