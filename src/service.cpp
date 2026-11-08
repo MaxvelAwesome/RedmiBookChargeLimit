@@ -41,7 +41,7 @@ CONDITION_VARIABLE g_cv = CONDITION_VARIABLE_INIT;
 ipc::State g_state;          // защищено g_lock
 uint64_t g_reqSeq = 0;       // номер запрошенного применения
 uint64_t g_doneSeq = 0;      // номер выполненного применения
-ULONGLONG g_fullChargeStart = 0;
+BYTE g_lastAc = 0xFF;        // последний известный источник питания (только поток обработчика SCM)
 
 void SetStatus(DWORD state, DWORD exitCode = NO_ERROR, DWORD waitHint = 0) {
     static DWORD checkpoint = 1;
@@ -339,9 +339,17 @@ DWORD WINAPI CtrlHandler(DWORD ctrl, DWORD type, LPVOID data, LPVOID) {
             break;
         case PBT_APMRESUMEAUTOMATIC:
         case PBT_APMRESUMESUSPEND:
-        case PBT_APMPOWERSTATUSCHANGE:
             SetEvent(g_kick.get());
             break;
+        case PBT_APMPOWERSTATUSCHANGE: {
+            // Событие приходит и при каждом изменении процента — реагируем только на смену источника питания.
+            SYSTEM_POWER_STATUS sps{};
+            if (GetSystemPowerStatus(&sps) && sps.ACLineStatus != g_lastAc) {
+                g_lastAc = sps.ACLineStatus;
+                SetEvent(g_kick.get());
+            }
+            break;
+        }
         default:
             break;
         }
@@ -378,6 +386,8 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
         LocalFree(sd);
     }
 
+    SYSTEM_POWER_STATUS sps{};
+    if (GetSystemPowerStatus(&sps)) g_lastAc = sps.ACLineStatus;
     g_state.enabled = app::RegGetDword(L"Enabled", 1) ? 1 : 0;
     g_state.fullCharge = app::RegGetDword(L"FullCharge", 0) ? 1 : 0;
     Log(L"Служба запущена. Лимит: %s.", g_state.enabled ? L"80%" : L"выкл");
